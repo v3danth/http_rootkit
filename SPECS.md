@@ -58,13 +58,13 @@ This specification documents a kernel-level data interception technique that mod
 │  │  │ Call Orig   │─▶│ Inspect     │─▶│ Magic Match?    │  │    │
 │  │  │ Function    │  │ Buffer      │  │ ┌─────┐ ┌────┐  │  │    │
 │  │  │             │  │             │  │ │ YES │ │ NO │  │  │    │
-│  │  └─────────────┘  └─────────────┘  │ └──┬──┘ └──┬─┘  │  │    │
-│  │                                         │       │    │  │    │
-│  │                                         ▼       ▼    │  │    │
-│  │                                  ┌────────┐ ┌────┐   │  │    │
-│  │                                  │Execute │ │Pass│   │  │    │
-│  │                                  │Payload │ │Thru│   │  │    │
-│  │                                  └────────┘ └────┘   │  │    │
+│  │  └─────────────┘  └─────────────┘  └─┼──┬──┼─┼──┬─┼──┘  │    │
+│  │                                         │       │       │    │
+│  │                                         ▼       ▼       │    │
+│  │                                  ┌────────┐ ┌────┐      │    │
+│  │                                  │Execute │ │Pass│      │    │
+│  │                                  │Payload │ │Thru│      │    │
+│  │                                  └────────┘ └────┘      │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
@@ -602,81 +602,81 @@ static int kernel_thread_payload(void *data) {
 ## 7. Data Flow Diagram
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                     COMPLETE DATA FLOW                                │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│  NETWORK                                                              │
-│     │                                                                 │
-│     │ TCP/TLS Packet                                                  │
-│     ▼                                                                 │
-│  ┌─────────────┐                                                      │
-│  │  NIC Driver │                                                      │
-│  └──────┬──────┘                                                      │
-│         │                                                             │
-│         │ sk_buff                                                     │
-│         ▼                                                             │
-│  ┌─────────────┐                                                      │
-│  │   TCP/IP    │                                                      │
-│  │   Stack     │                                                      │
-│  └──────┬──────┘                                                      │
-│         │                                                             │
-│         │ Decrypted data (if TLS terminated in kernel)                │
-│         │ OR encrypted payload (if TLS in userspace)                  │
-│         ▼                                                             │
+┌──────────────────────────────────────────────────────────────────────┐
+│                     COMPLETE DATA FLOW                               │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  NETWORK                                                             │
+│     │                                                                │
+│     │ TCP/TLS Packet                                                 │
+│     ▼                                                                │
+│  ┌─────────────┐                                                     │
+│  │  NIC Driver │                                                     │
+│  └──────┬──────┘                                                     │
+│         │                                                            │
+│         │ sk_buff                                                    │
+│         ▼                                                            │
+│  ┌─────────────┐                                                     │
+│  │   TCP/IP    │                                                     │
+│  │   Stack     │                                                     │
+│  └──────┬──────┘                                                     │
+│         │                                                            │
+│         │ Decrypted data (if TLS terminated in kernel)               │
+│         │ OR encrypted payload (if TLS in userspace)                 │
+│         ▼                                                            │
 │  ┌─────────────────────────────────────────────────────────────┐     │
-│  │                    SOCKET BUFFER                             │     │
+│  │                    SOCKET BUFFER                            │     │
 │  │  ┌─────────────────────────────────────────────────────┐    │     │
 │  │  │  [TLS Record Header][Encrypted Payload][MAC]        │    │     │
 │  │  └─────────────────────────────────────────────────────┘    │     │
 │  └─────────────────────────┬───────────────────────────────────┘     │
-│                            │                                          │
-│                            │ read()/recv() syscall                    │
-│                            ▼                                          │
+│                            │                                         │
+│                            │ read()/recv() syscall                   │
+│                            ▼                                         │
 │  ┌─────────────────────────────────────────────────────────────┐     │
-│  │                   HOOKED SYSCALL                              │     │
-│  │                                                               │     │
-│  │  1. Check: Is target process? ──NO──▶ Call original, return  │     │
-│  │                    │YES                                       │     │
-│  │                    ▼                                          │     │
-│  │  2. Call original sys_read()                                  │     │
-│  │                    │                                          │     │
-│  │                    ▼                                          │     │
-│  │  3. Copy buffer to kernel space                               │     │
-│  │     ┌───────────────────────────────────────────────────┐    │     │
-│  │     │ User Buffer Contents:                             │    │     │
-│  │     │ [HTTP/2 Frame][Headers][Body with magic]          │    │     │
-│  │     │                    ^                               │    │     │
-│  │     │                    │                               │    │     │
-│  │     │              Magic Here:                           │    │     │
-│  │     │              7f 4c 41 42 52 41 ...                 │    │     │
-│  │     └───────────────────────────────────────────────────┘    │     │
-│  │                    │                                          │     │
-│  │                    ▼                                          │     │
-│  │  4. check_magic_sequence() ──NO──▶ Return to user            │     │
-│  │                    │YES                                       │     │
-│  │                    ▼                                          │     │
-│  │  5. handle_magic_trigger()                                   │     │
+│  │                   HOOKED SYSCALL                            │     │
+│  │                                                             │     │
+│  │  1. Check: Is target process? ──NO──▶ Call original, return │     │
+│  │                    │YES                                     │     │
+│  │                    ▼                                        │     │
+│  │  2. Call original sys_read()                                │     │
+│  │                    │                                        │     │
+│  │                    ▼                                        │     │
+│  │  3. Copy buffer to kernel space                             │     │
+│  │     ┌───────────────────────────────────────────────────┐   │     │
+│  │     │ User Buffer Contents:                             │   │     │
+│  │     │ [HTTP/2 Frame][Headers][Body with magic]          │   │     │
+│  │     │                    ^                              │   │     │
+│  │     │                    │                              │   │     │
+│  │     │              Magic Here:                          │   │     │
+│  │     │              7f 4c 41 42 52 41 ...                │   │     │
+│  │     └───────────────────────────────────────────────────┘   │     │
+│  │                    │                                        │     │
+│  │                    ▼                                        │     │
+│  │  4. check_magic_sequence() ──NO──▶ Return to user           │     │
+│  │                    │YES                                     │     │
+│  │                    ▼                                        │     │
+│  │  5. handle_magic_trigger()                                  │     │
 │  │     ├── Execute payload                                     │     │
 │  │     ├── Optionally sanitize buffer                          │     │
 │  │     └── Return to user (appears normal)                     │     │
-│  │                                                               │     │
+│  │                                                             │     │
 │  └─────────────────────────────────────────────────────────────┘     │
-│                            │                                          │
-│                            │ Modified/clean buffer                    │
-│                            ▼                                          │
+│                            │                                         │
+│                            │ Modified/clean buffer                   │
+│                            ▼                                         │
 │  ┌─────────────────────────────────────────────────────────────┐     │
-│  │              APPLICATION BUFFER                              │     │
+│  │              APPLICATION BUFFER                             │     │
 │  │  ┌─────────────────────────────────────────────────────┐    │     │
 │  │  │ [HTTP/2 Frame][Headers][Sanitized Body]             │    │     │
-│  │  │                              (magic removed/hidden)  │    │     │
+│  │  │                             (magic removed/hidden)  │    │     │
 │  │  └─────────────────────────────────────────────────────┘    │     │
 │  └─────────────────────────────────────────────────────────────┘     │
-│                            │                                          │
-│                            ▼                                          │
-│                    APPLICATION PROCESSES NORMALLY                     │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
+│                            │                                         │
+│                            ▼                                         │
+│                    APPLICATION PROCESSES NORMALLY                    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1067,24 +1067,24 @@ static int integrity_monitor(void *data) {
 ┌────────────────────────────────────────────────────────────────────┐
 │                 LINUX KERNEL PROTECTION EVOLUTION                  │
 ├────────────────────────────────────────────────────────────────────┤
-│                                                                     │
+│                                                                    │
 │  Kernel Version    Protection               Bypass Difficulty      │
 │  ───────────────   ──────────────────────   ────────────────────   │
-│  2.4 - 2.6.18     None (writable SCT)      Trivial                │
+│  2.4 - 2.6.18     None (writable SCT)      Trivial                 │
 │  2.6.19 - 3.6      RODATA (ro after init)   CR0 manipulation       │
-│  3.7 - 4.4         + kptr_restrict         kallsyms bypass        │
-│  4.5 - 5.4         + PAGE_TABLE_ISOLATION   More complex          │
-│  5.5 - 5.9         + CFI (optional)         ROP required          │
-│  5.10+             + KCFI, FineIBT         Very difficult        │
-│  6.2+              + Shadow stacks          Extremely difficult   │
-│                                                                     │
-│  Additional protections:                                            │
+│  3.7 - 4.4         + kptr_restrict         kallsyms bypass         │
+│  4.5 - 5.4         + PAGE_TABLE_ISOLATION   More complex           │
+│  5.5 - 5.9         + CFI (optional)         ROP required           │
+│  5.10+             + KCFI, FineIBT         Very difficult          │
+│  6.2+              + Shadow stacks          Extremely difficult    │
+│                                                                    │
+│  Additional protections:                                           │
 │  - CONFIG_CFI_CLANG: Control Flow Integrity                        │
-│  - CONFIG_BPF_JIT: eBPF JIT (can be used for detection)           │
+│  - CONFIG_BPF_JIT: eBPF JIT (can be used for detection)            │
 │  - CONFIG_KASAN: Kernel Address Sanitizer                          │
 │  - CONFIG_UBSAN: Undefined Behavior Sanitizer                      │
-│  - CONFIG_HARDENED_USERCOPY: Validate copy_to/from_user           │
-│                                                                     │
+│  - CONFIG_HARDENED_USERCOPY: Validate copy_to/from_user            │
+│                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1094,32 +1094,32 @@ static int integrity_monitor(void *data) {
 
 ### 11.1 Memory IOCs
 
-| Indicator | Description | Detection Method |
-|-----------|-------------|------------------|
-| SCT entry outside `.text` | Handler not in kernel code section | Memory scan |
-| CR0 WP bit toggling | Write protection bypass attempt | Kprobe on `write_cr0` |
-| Unexpected `ioremap` calls | Physical memory mapping for hook | Audit ioremap calls |
-| Modified page table entries | Pages marked writable unexpectedly | Page table walk |
-| Hidden kernel memory | Unaccounted kernel memory regions | Memory map analysis |
+| Indicator                   | Description                        | Detection Method      |
+|-----------------------------|------------------------------------|-----------------------|
+| SCT entry outside `.text`   | Handler not in kernel code section | Memory scan           |
+| CR0 WP bit toggling         | Write protection bypass attempt    | Kprobe on `write_cr0` |
+| Unexpected `ioremap` calls  | Physical memory mapping for hook   | Audit ioremap calls   |
+| Modified page table entries | Pages marked writable unexpectedly | Page table walk       |
+| Hidden kernel memory        | Unaccounted kernel memory regions  | Memory map analysis   |
 
 ### 11.2 Behavioral IOCs
 
-| Indicator | Description | Detection Method |
-|-----------|-------------|------------------|
-| Syscall latency spikes | Hook adds processing delay | Timing analysis |
-| Unexpected context switches | Hook triggers payload | Tracing |
-| Network connections from kernel | Kernel-originated sockets | Netfilter logging |
-| Process credential changes | `commit_creds` from unusual caller | Audit subsystem |
-| Usermodehelper calls | Kernel spawning user processes | Audit logging |
+| Indicator                       | Description                        | Detection Method  |
+|---------------------------------|------------------------------------|-------------------|
+| Syscall latency spikes          | Hook adds processing delay         | Timing analysis   |
+| Unexpected context switches     | Hook triggers payload              | Tracing           |
+| Network connections from kernel | Kernel-originated sockets          | Netfilter logging |
+| Process credential changes      | `commit_creds` from unusual caller | Audit subsystem   |
+| Usermodehelper calls            | Kernel spawning user processes     | Audit logging     |
 
 ### 11.3 Artifact IOCs
 
-| Indicator | Description | Location |
-|-----------|-------------|----------|
-| Unknown kernel modules | LKM not in package database | `/proc/modules` |
-| Modified kernel image | On-disk kernel differs from running | Compare `/boot/vmlinuz` with memory |
-| Persistent kernel config | Modules loaded at boot | `/etc/modprobe.d/`, initramfs |
-| Hidden files | Rootkit components | Forensic filesystem analysis |
+|      Indicator           | Description                         | Location                            |
+|--------------------------|-------------------------------------|-------------------------------------|
+| Unknown kernel modules   | LKM not in package database         | `/proc/modules`                     |
+| Modified kernel image    | On-disk kernel differs from running | Compare `/boot/vmlinuz` with memory |
+| Persistent kernel config | Modules loaded at boot              | `/etc/modprobe.d/`, initramfs       |
+| Hidden files             | Rootkit components                  | Forensic filesystem analysis        |
 
 ---
 
@@ -1225,7 +1225,7 @@ class TestSyscallHookDetection:
 
 ### Tools
 1. **Detection**: rkhunter, chkrootkit, Lynis, OSSEC
-2. **Analysis**: Volatility, LiME,批量内存取证
+2. **Analysis**: Volatility, LiME,批量内存取证????
 3. **Monitoring**: eBPF tools (bcc, libbpf), auditd
 4. **Testing**: QEMU + GDB, syzkaller, kAFL
 
@@ -1235,11 +1235,11 @@ class TestSyscallHookDetection:
 
 | Architecture | read | write | recvfrom | readv |
 |--------------|------|-------|----------|-------|
-| x86_64 | 0 | 1 | 62 | 65 |
-| x86 (32-bit) | 3 | 4 | 292 | 145 |
-| ARM64 | 63 | 64 | 207 | 65 |
-| ARM (32-bit) | 3 | 4 | 292 | 145 |
-| RISC-V | 63 | 64 | 207 | 65 |
+| x86_64       | 0    | 1     | 62       | 65    |
+| x86 (32-bit) | 3    | 4     | 292      | 145   |
+| ARM64        | 63   | 64    | 207      | 65    |
+| ARM (32-bit) | 3    | 4     | 292      | 145   |
+| RISC-V       | 63   | 64    | 207      | 65    |
 
 ---
 
