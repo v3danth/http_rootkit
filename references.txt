@@ -1,2 +1,6 @@
-3   LD_PRELOAD:
-  1 https://www.youtube.com/watch?v=9Tmc5dKvqhs
+LD_PRELOAD:
+https://www.youtube.com/watch?v=9Tmc5dKvqhs
+
+How to build Malware:
+https://youtu.be/IcLFN1KKaSg?si=A64HsDh8JhBI24iQ
+https://youtu.be/uFNTmzoyjqA?si=v_NJRwqTldngBAj7
