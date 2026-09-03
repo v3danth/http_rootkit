@@ -5,7 +5,11 @@ BPFTOOL ?= bpftool
 CC      ?= gcc
 UNAME_R ?= $(shell uname -r)
 KDIR    ?= /lib/modules/$(UNAME_R)/build
-ARCH    ?= $(shell uname -m | sed 's/x86_64/x86/;s/i.86/x86/')
+HOST_ARCH := $(shell uname -m)
+ifeq ($(filter x86_64 amd64,$(HOST_ARCH)),)
+$(error Unsupported architecture $(HOST_ARCH): sct-guard requires x86_64 Linux)
+endif
+ARCH    ?= x86
 
 BPFOBJ  := build/sct_detect.bpf.o
 SKEL    := build/sct_detect.skel.h
